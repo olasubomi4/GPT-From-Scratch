@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from .attention import Block
+from .utils import precompute_rope_freqs
+
 
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size, n_embed, block_size, n_head, n_layer, dropout, device, profile) -> None:
@@ -9,24 +11,35 @@ class BigramLanguageModel(nn.Module):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.device = device
-        
+
         self.embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        # self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.Sequential(*[
-            Block(n_embed, n_heads=n_head, block_size=block_size, dropout=dropout, profile=profile) 
+            Block(n_embed, n_heads=n_head, block_size=block_size, dropout=dropout, profile=profile)
             for _ in range(n_layer)
         ])
         self.ln_f = nn.LayerNorm(n_embed)
         self.lmhead = nn.Linear(n_embed, vocab_size)
 
+        # Precompute RoPE freqs for a larger sequence length.
+        # Absolute positions are used to ensure cached and non-cached results match.
+        self.max_gen_len = 2048 
+        self.freqs_complex = precompute_rope_freqs(n_embed // n_head, self.max_gen_len, device=device).to(device)
+
     def forward(self, idx, targets=None, use_cache=False, pos_offset=0):
         B, T = idx.shape
 
         token_emb = self.embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device) + pos_offset)  # (T, C)
-        x = token_emb + pos_emb  # (B, T, C)
+        # pos_emb = self.position_embedding_table(torch.arange(T, device=self.device) + pos_offset)  # (T, C)
+        # x = token_emb + pos_emb  # (B, T, C)
+        x = token_emb
+
+        # Get appropriate freqs for the current sequence/cache position
+
+        freqs_complex = self.freqs_complex[pos_offset:pos_offset + T]
+
         for block in self.blocks:
-            x = block(x, use_cache=use_cache)
+            x = block(x, use_cache=use_cache, freqs_complex=freqs_complex)
         x = self.ln_f(x)  # (B, T, C)
         logits = self.lmhead(x)  # (B, T, vocab_size)
 
@@ -37,7 +50,7 @@ class BigramLanguageModel(nn.Module):
             logits = logits.view(B * T, C)
             targets = targets.view(B * T)
             loss = F.cross_entropy(logits, targets)
-            
+
         return logits, loss
 
     def reset_cache(self):
@@ -50,10 +63,13 @@ class BigramLanguageModel(nn.Module):
         self.eval()
 
         if not use_cache:
+            pos_offset = 0
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -self.block_size:]
-                logits, _ = self(idx_cond, use_cache=False, pos_offset=0)
 
+
+                logits, _ = self(idx_cond, use_cache=False, pos_offset=pos_offset)
+                pos_offset+=1
                 logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
                 next_idx = torch.multinomial(probs, num_samples=1)
@@ -66,13 +82,17 @@ class BigramLanguageModel(nn.Module):
 
         # Initial prefill
         idx_cond = idx[:, -self.block_size:]
+        current_L = idx.shape[1]
+        prefill_pos_offset = max(0, current_L - self.block_size)
+        
         logits, _ = self(
             idx_cond,
             use_cache=True,
-            pos_offset=0
+            pos_offset=prefill_pos_offset
         )
 
-        cache_pos = idx_cond.shape[1] - 1
+        # cache_pos is the absolute position index of the LAST token we just processed
+        cache_pos = current_L - 1
 
         for _ in range(max_new_tokens):
 
@@ -80,29 +100,14 @@ class BigramLanguageModel(nn.Module):
             probs = F.softmax(logits_last, dim=-1)
             next_idx = torch.multinomial(probs, num_samples=1)
 
-            prev_idx = idx[:, -1:]
             idx = torch.cat((idx, next_idx), dim=1)
 
-            if cache_pos < self.block_size - 1:
-                cache_pos += 1
-                logits, _ = self(
-                    next_idx,
-                    use_cache=True,
-                    pos_offset=cache_pos
-                )
-            else:
-                self.reset_cache()
-                logits, _ = self(
-                    prev_idx,
-                    use_cache=True,
-                    pos_offset=0
-                )
-                logits, _ = self(
-                    next_idx,
-                    use_cache=True,
-                    pos_offset=1
-                )
-                cache_pos = 1
+            cache_pos += 1
+            logits, _ = self(
+                next_idx,
+                use_cache=True,
+                pos_offset=cache_pos
+            )
 
         return idx
 

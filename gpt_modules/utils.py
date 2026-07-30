@@ -30,6 +30,7 @@ class TimingProfiler:
 
         print(f"\nTotal measured time: {total_runtime:.6f}s")
 
+
 class KVCache:
     def __init__(self, max_seq_len):
         self.max_seq_len = max_seq_len
@@ -46,7 +47,7 @@ class KVCache:
         if self.cache_k is None:
             self.cache_k = torch.zeros(
                 B,
-                self.max_seq_len,
+                256,
                 C,
                 device=new_k.device,
                 dtype=new_k.dtype
@@ -54,7 +55,7 @@ class KVCache:
 
             self.cache_v = torch.zeros(
                 B,
-                self.max_seq_len,
+                256,
                 C,
                 device=new_v.device,
                 dtype=new_v.dtype
@@ -65,9 +66,9 @@ class KVCache:
         for t in range(T):
 
             # Cache not full
-            if self.cur_len < self.max_seq_len:
-                self.cache_k[:, self.cur_len:self.cur_len+1] = new_k[:, t:t+1]
-                self.cache_v[:, self.cur_len:self.cur_len+1] = new_v[:, t:t+1]
+            if self.cur_len < 256:
+                self.cache_k[:, self.cur_len:self.cur_len + 1] = new_k[:, t:t + 1]
+                self.cache_v[:, self.cur_len:self.cur_len + 1] = new_v[:, t:t + 1]
                 self.cur_len += 1
 
             # Sliding window
@@ -75,8 +76,8 @@ class KVCache:
                 self.cache_k[:, :-1] = self.cache_k[:, 1:].clone()
                 self.cache_v[:, :-1] = self.cache_v[:, 1:].clone()
 
-                self.cache_k[:, -1:] = new_k[:, t:t+1]
-                self.cache_v[:, -1:] = new_v[:, t:t+1]
+                self.cache_k[:, -1:] = new_k[:, t:t + 1]
+                self.cache_v[:, -1:] = new_v[:, t:t + 1]
 
         return (
             self.cache_k[:, :self.cur_len],
@@ -87,3 +88,35 @@ class KVCache:
         self.cache_k = None
         self.cache_v = None
         self.cur_len = 0
+
+
+def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float = 10000.0, device: str = 'cpu'):
+    """
+    Precompute the frequencies for rotary positional embeddings.
+    """
+    # Half of the dimension is used for cosine and sine
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(max_seq_len, device=device)
+    freqs = torch.outer(t, freqs).to(device)  # (max_seq_len, dim/2)
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)  # (max_seq_len, dim/2)
+    return freqs_complex
+
+
+def apply_rope(x: torch.Tensor, freqs_complex: torch.Tensor, device: str = 'cpu'):
+    """
+    Apply rotary positional embeddings to a tensor.
+    """
+    # x: (B, T, head_size)
+    # freqs_complex: (T, head_size/2)
+
+    # Reshape x to complex numbers
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (B, T, head_size/2)
+
+    # Broadcast freqs_complex to match B
+    freqs_complex = freqs_complex.unsqueeze(0)  # (1, T, head_size/2)
+
+    # Multiply
+    x_rotated = x_complex * freqs_complex  # (B, T, head_size/2)
+
+    out = torch.view_as_real(x_rotated).reshape(*x.shape)  # (B, T, head_size)
+    return out.type_as(x)

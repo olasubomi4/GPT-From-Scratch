@@ -61,7 +61,7 @@ def main():
 
 
     # Check for pre-trained weights
-    weights_path = "/Users/olasubomiodekunle/PycharmProjects/GPT-From-Scratch/model_weights_2026-07-23 22:36:09.437281.pth"
+    weights_path = "/Users/olasubomiodekunle/PycharmProjects/GPT-From-Scratch/model_weights_20260728_185223.pth"
     if os.path.exists(weights_path):
         print(f"Loading weights from {weights_path}")
         model.load_state_dict(torch.load(weights_path, map_location=device))
@@ -100,7 +100,7 @@ def main():
     
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     start_time = datetime.now()
-    result_ids = m.generate(context, max_new_tokens=500, use_cache=use_kv_cache)[0].tolist()
+    result_ids = m.generate(context, max_new_tokens=1000, use_cache=use_kv_cache)[0].tolist()
     end_time = datetime.now()
     
     print(data_loader.decode(result_ids))
