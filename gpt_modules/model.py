@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from sympy.physics.units import temperature
 from torch.nn import functional as F
 from .attention import Block
 from .utils import precompute_rope_freqs
@@ -25,6 +26,7 @@ class BigramLanguageModel(nn.Module):
         # Absolute positions are used to ensure cached and non-cached results match.
         self.max_gen_len = 2048 
         self.freqs_complex = precompute_rope_freqs(n_embed // n_head, self.max_gen_len, device=device).to(device)
+        self.logs_shown=False
 
     def forward(self, idx, targets=None, use_cache=False, pos_offset=0):
         B, T = idx.shape
@@ -59,7 +61,7 @@ class BigramLanguageModel(nn.Module):
                 head.kv.clear()
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, use_cache=False):
+    def generate(self, idx, max_new_tokens, use_cache=False, temperature=0.5, top_k=65, repetition_penalty=1):
         self.eval()
 
         if not use_cache:
@@ -70,9 +72,13 @@ class BigramLanguageModel(nn.Module):
 
                 logits, _ = self(idx_cond, use_cache=False, pos_offset=pos_offset)
                 pos_offset+=1
-                logits = logits[:, -1, :]
-                probs = F.softmax(logits, dim=-1)
-                next_idx = torch.multinomial(probs, num_samples=1)
+                logits_last = logits[:, -1, :]
+                logits_last = self.__perform_repetition_penalty(logits_last,idx, repetition_penalty=repetition_penalty)
+                logits_last = self.__perform_top_k_filtering(logits_last,
+                                                             top_k=top_k)
+                next_idx = self.__perform_temperature_scaling(logits_last, temperature=temperature)
+
+                self.logs_shown = True
 
                 idx = torch.cat((idx, next_idx), dim=1)
 
@@ -95,11 +101,11 @@ class BigramLanguageModel(nn.Module):
         cache_pos = current_L - 1
 
         for _ in range(max_new_tokens):
-
             logits_last = logits[:, -1, :]
-            probs = F.softmax(logits_last, dim=-1)
-            next_idx = torch.multinomial(probs, num_samples=1)
-
+            logits_last = self.__perform_repetition_penalty(logits_last, idx, repetition_penalty=repetition_penalty)
+            logits_last = self.__perform_top_k_filtering(logits_last, top_k=top_k)
+            next_idx=self.__perform_temperature_scaling(logits_last, temperature=temperature)
+            self.logs_shown = True
             idx = torch.cat((idx, next_idx), dim=1)
 
             cache_pos += 1
@@ -110,6 +116,49 @@ class BigramLanguageModel(nn.Module):
             )
 
         return idx
+    def __perform_temperature_scaling(self, logits, temperature):
+        if temperature == 0.0:
+            next_idx= torch.argmax(logits, dim=-1,keepdim=True)
+        else:
+            logits = logits / temperature
+            probs = F.softmax(logits, dim=-1)
+            if not self.logs_shown:
+                print(f"probs: {probs}")
+            next_idx = torch.multinomial(probs, num_samples=1)
+
+        if not self.logs_shown:
+            print(f"Temperature: {temperature}")
+
+
+        return next_idx
+
+    def __perform_top_k_filtering(self,logits: torch.Tensor, top_k):
+        max_prediction_token_size = logits.shape[-1]
+        if top_k >max_prediction_token_size:
+            top_k = max_prediction_token_size
+
+        top_k_logits,_= torch.topk(logits, top_k)
+
+        cutoff = top_k_logits[:,-1].unsqueeze(1)
+
+        logits= logits.masked_fill(logits < cutoff, float("-inf"))
+
+        if not self.logs_shown:
+            print(f"Top-k: {top_k}, cutoff: {cutoff.item()}, logits: {logits.shape}")
+        return logits
+
+    def __perform_repetition_penalty(self, logits, predicted_tokens,repetition_penalty):
+        if repetition_penalty == 0.0:
+            return logits
+        batch_size, vocab_size = logits.shape
+
+        for batch in range(batch_size):
+            for token in predicted_tokens[batch]:
+                if logits[batch, token] > 0:
+                    logits[batch, token] /=repetition_penalty
+                else:
+                    logits[batch, token] *=repetition_penalty
+        return logits
 
     @torch.no_grad()
     def compare_cache(self, idx):
