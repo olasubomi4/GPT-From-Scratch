@@ -22,6 +22,10 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
+    def _record_profile(self, name: str, seconds: float):
+        if self.profile is not None:
+            self.profile.record(name, seconds)
+
     def forward(self, x, use_cache=False, freqs_complex=None):
         B, T, C = x.shape
         q = self.query(x)
@@ -36,7 +40,7 @@ class Head(nn.Module):
             start = datetime.now()
             k, v = self.kv.update(k, v)
             end = datetime.now()
-            self.profile.record("KVCache", (end - start).total_seconds())
+            self._record_profile("KVCache", (end - start).total_seconds())
 
             start = datetime.now()
             wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
@@ -58,7 +62,7 @@ class Head(nn.Module):
 
             out = wei @ v
             end = datetime.now()
-            self.profile.record("Attention", (end - start).total_seconds())
+            self._record_profile("Attention", (end - start).total_seconds())
             return out
 
         else:
@@ -70,7 +74,7 @@ class Head(nn.Module):
 
             out = wei @ v
             end = datetime.now()
-            self.profile.record("Attention", (end - start).total_seconds())
+            self._record_profile("Attention", (end - start).total_seconds())
             return out
 
 

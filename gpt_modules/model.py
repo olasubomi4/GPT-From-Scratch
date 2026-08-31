@@ -28,7 +28,7 @@ class BigramLanguageModel(nn.Module):
         self.freqs_complex = precompute_rope_freqs(n_embed // n_head, self.max_gen_len, device=device).to(device)
         self.logs_shown=False
 
-    def forward(self, idx, targets=None, use_cache=False, pos_offset=0):
+    def forward(self, idx, targets=None, use_cache=False, pos_offset=0, loss_mask=None):
         B, T = idx.shape
 
         token_emb = self.embedding_table(idx)  # (B,T,C)
@@ -50,8 +50,13 @@ class BigramLanguageModel(nn.Module):
         else:
             B, T, C = logits.shape
             logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
+            targets = targets.reshape(B * T)
+            if loss_mask is not None:
+                loss = F.cross_entropy(logits, targets, reduction='none')
+                mask_flat = loss_mask.reshape(B * T)
+                loss = (loss * mask_flat).sum() / mask_flat.sum().clamp(min=1)
+            else:
+                loss = F.cross_entropy(logits, targets)
 
         return logits, loss
 
@@ -61,26 +66,35 @@ class BigramLanguageModel(nn.Module):
                 head.kv.clear()
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, use_cache=False, temperature=0.5, top_k=65, repetition_penalty=1):
+    def generate(self, idx, max_new_tokens, use_cache=False, temperature=0.5, top_k=65, repetition_penalty=1, stop_token_ids=None):
         self.eval()
+
+        def _hit_stop(sequence):
+            """Return True if the last tokens of sequence match stop_token_ids."""
+            if stop_token_ids is None or len(stop_token_ids) == 0:
+                return False
+            n = len(stop_token_ids)
+            if sequence.shape[1] < n:
+                return False
+            return sequence[0, -n:].tolist() == stop_token_ids
 
         if not use_cache:
             pos_offset = 0
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -self.block_size:]
 
-
                 logits, _ = self(idx_cond, use_cache=False, pos_offset=pos_offset)
-                pos_offset+=1
+                pos_offset += 1
                 logits_last = logits[:, -1, :]
-                logits_last = self.__perform_repetition_penalty(logits_last,idx, repetition_penalty=repetition_penalty)
-                logits_last = self.__perform_top_k_filtering(logits_last,
-                                                             top_k=top_k)
+                logits_last = self.__perform_repetition_penalty(logits_last, idx, repetition_penalty=repetition_penalty)
+                logits_last = self.__perform_top_k_filtering(logits_last, top_k=top_k)
                 next_idx = self.__perform_temperature_scaling(logits_last, temperature=temperature)
 
                 self.logs_shown = True
-
                 idx = torch.cat((idx, next_idx), dim=1)
+
+                if _hit_stop(idx):
+                    break
 
             return idx
 
@@ -104,9 +118,12 @@ class BigramLanguageModel(nn.Module):
             logits_last = logits[:, -1, :]
             logits_last = self.__perform_repetition_penalty(logits_last, idx, repetition_penalty=repetition_penalty)
             logits_last = self.__perform_top_k_filtering(logits_last, top_k=top_k)
-            next_idx=self.__perform_temperature_scaling(logits_last, temperature=temperature)
+            next_idx = self.__perform_temperature_scaling(logits_last, temperature=temperature)
             self.logs_shown = True
             idx = torch.cat((idx, next_idx), dim=1)
+
+            if _hit_stop(idx):
+                break
 
             cache_pos += 1
             logits, _ = self(
